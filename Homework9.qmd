@@ -1,0 +1,425 @@
+---
+title: "Homework 9"
+author: "Eric Song"
+format: html
+editor: visual
+---
+
+## Previous Code from HW8.
+
+Output off.
+
+```{r, warning=FALSE, output=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(dplyr)
+library(glmnet)
+library(tree)
+library(rpart)
+library(rpart.plot)
+library(baguette)
+library(ranger)
+bike_data <- read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",
+                      local = locale(encoding = "latin1"))
+bike_data <- bike_data |>
+  mutate(date = lubridate::dmy(Date)) |>
+  select(-Date)
+bike_data <- bike_data |>
+  mutate(seasons = factor(Seasons),
+         holiday = factor(Holiday),
+         fn_day = factor(`Functioning Day`)) |>
+  select(-Seasons, -Holiday, -`Functioning Day`)
+bike_data <- bike_data |>
+  rename('bike_count' = `Rented Bike Count`,
+         'hour' = "Hour",
+         "temp" = `Temperature(°C)`,
+         "wind_speed" = `Wind speed (m/s)`,
+         "humidity" = `Humidity(%)`,
+         "vis" = `Visibility (10m)`,
+         "dew_point_temp" = `Dew point temperature(°C)`,
+         "solar_radiation" = `Solar Radiation (MJ/m2)`,
+         "rainfall" = "Rainfall(mm)",
+         "snowfall" = `Snowfall (cm)`)
+bike_data <- bike_data |>
+  filter(fn_day == "Yes") |>
+  select(-fn_day)
+
+bike_data <- bike_data |>
+  group_by(date, seasons, holiday) |>
+  summarize(bike_count = sum(bike_count),
+            temp = mean(temp),
+            humidity = mean(humidity),
+            wind_speed = mean(wind_speed),
+            vis = mean(vis),
+            dew_point_temp = mean(dew_point_temp),
+            solar_radiation = mean(solar_radiation),
+            rainfall = sum(rainfall),
+            snowfall = sum(snowfall)) |>
+            ungroup()
+set.seed(11)
+bike_split <- initial_split(bike_data, prop = 0.75, strata = seasons)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+bike_10_fold <- vfold_cv(bike_train, 10)
+
+#Cleaned up code.  We found MLR_rec1 to be the best model in HW8.
+MLR_rec1 <- recipe(bike_count ~ ., data = bike_train) |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |>
+  step_rm(date, date_dow) |>
+  step_dummy(seasons, holiday, day_type) |>
+  step_normalize(all_numeric(), -bike_count)
+
+MLR_spec <- linear_reg() |>
+  set_engine("lm")
+
+#Need this code snippet for unfitted for later
+MLR_wkf1 <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(MLR_spec)
+
+MLR_CV_fit1 <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(MLR_spec) |>
+  fit_resamples(bike_10_fold)
+
+final_fit <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(MLR_spec) |>
+  last_fit(bike_split,metrics=metric_set(rmse,mae))
+```
+
+## Lasso Model
+
+To Recap:
+
+Our coefficient table for our MLR model from the previous HW.
+
+```{r}
+#Final Model
+final_fit |>
+  collect_metrics()
+final_fit_co <- final_fit |>
+  extract_fit_parsnip() |>
+  tidy()
+final_fit_co
+```
+
+Now finding our LASSO model.  
+
+```{r}
+set.seed(11)  
+LASSO_spec <-linear_reg(penalty=tune(),mixture=1) |>
+  set_engine("glmnet")
+
+LASSO_wkf <-workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(LASSO_spec)
+
+#Fitting the model
+LASSO_grid <-LASSO_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(penalty(), levels = 200)) 
+LASSO_grid[1, ".metrics"][[1]]
+```
+
+200 seperate Lasso models.  Plotting our RMSE.
+
+```{r}
+LASSO_grid |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line()
+```
+
+Interesting that they are the same.  Finding the lowest penalty.
+
+```{r}
+lowest_rmse <-LASSO_grid |>
+  select_best(metric="rmse")
+lowest_rmse
+
+```
+
+
+Fitting our best model and printing coefficients.
+
+```{r}
+LASSO_wkf |>
+  finalize_workflow(lowest_rmse)
+
+LASSO_final <- LASSO_wkf |>
+  finalize_workflow(lowest_rmse) |>
+  fit(bike_train)
+  tidy(LASSO_final)
+
+```
+## Regression Tree Model
+
+
+Seeing rough plot of our regression tree.
+```{r}
+fitTree <- tree(bike_count ~ ., data = bike_train) 
+plot(fitTree)
+text(fitTree)
+```
+
+Fitting/Tuning our model. 
+
+```{r}
+set.seed(11)
+tree_mod <- decision_tree(tree_depth = tune(),
+                          min_n = 20,
+                          cost_complexity = tune()) |>
+                          set_engine("rpart") |>
+                          set_mode("regression")
+
+tree_wkf <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(tree_mod)
+
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = c(10, 5))
+
+tree_fits <- tree_wkf |> 
+  tune_grid(resamples = bike_10_fold,
+            grid = tree_grid)
+tree_fits |>
+  collect_metrics() 
+```
+Plotting our RMSE values by tree depth.
+
+```{r}
+tree_fits %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+
+tree_fits |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+Looks like tree depth of 11 or possibly 15 is our best fit.
+Finding the best model based on rmse.
+
+```{r}
+tree_best_params <- select_best(tree_fits,metric= "rmse")
+tree_best_params
+```
+
+Fitting our final model and plotting the tree.
+
+```{r}
+tree_final_wkf <- tree_wkf |>
+  finalize_workflow(tree_best_params)
+
+tree_final_fit <- tree_final_wkf |>
+  last_fit(bike_split)
+
+tree_final_fit |>
+  collect_metrics()
+
+tree_final_model <- extract_workflow(tree_final_fit) 
+tree_final_model |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot(roundint = FALSE)
+```
+
+## Bagged Tree Model
+
+Fitting and bagging our model.  
+
+```{r}
+bag_spec <- bag_tree(tree_depth = 15, min_n = 20, cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+bag_wkf <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(bag_spec)
+
+bag_fit <- bag_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(cost_complexity(),
+                                levels = 15),
+            metrics = metric_set(rmse))
+bag_fit |>
+  collect_metrics() |>
+  filter(.metric=="rmse") |>
+  arrange(mean)
+```
+
+Selecting the best model.
+
+```{r}
+bag_best_parmas <- select_best(bag_fit,metric="rmse")
+#Best model
+bag_best_parmas
+bag_final_wkf <- bag_wkf |>
+  finalize_workflow(bag_best_parmas)
+bag_final_fit <- bag_final_wkf |>
+  last_fit(bike_split)
+bag_final_fit |>
+    collect_metrics()
+```
+
+Plotting variables by importance.
+
+
+```{r}
+bag_imp <- extract_fit_engine(bag_final_fit)
+bag_imp$imp |>
+  mutate(term = factor(term,levels=term)) |>
+  ggplot(aes(x=term,y=value)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  labs(
+    title = "Variables of Importance",
+    x = "Variables",
+    y = "Importance"
+  )
+
+```
+
+## Random Forest Model
+
+```{r}
+rf_spec <- rand_forest(mtry = tune()) |>
+  #it took me forever to figure out adding the impurity
+  set_engine("ranger",importance="impurity") |>
+  set_mode("regression")
+
+rf_wkf <- workflow() |>
+  add_recipe(MLR_rec1) |>
+  add_model(rf_spec)
+
+rf_fit <- rf_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = 10,
+            metrics = metric_set(rmse))
+rf_fit |>
+  collect_metrics() |>
+  filter(.metric =="rmse") |>
+  arrange(mean)
+```
+
+Selecting best model
+
+```{r}
+rf_best_params <-select_best(rf_fit,metric="rmse")
+rf_best_params
+```
+
+```{r}
+rf_final_wkf <- rf_wkf |>
+  finalize_workflow(rf_best_params)
+rf_final_fit <- rf_final_wkf |>
+  last_fit(bike_split)
+```
+
+Plotting Variables by importance.
+
+```{r}
+rf_imp <- rf_final_fit |>
+  extract_fit_parsnip()
+
+rf_imp_tib <- enframe(
+  rf_imp$fit$variable.importance,
+  name = "Variable",
+  value = "Importance"
+) |>
+  arrange(desc(Importance))
+
+ggplot(rf_imp_tib, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat="identity") +
+  coord_flip() +
+  labs(
+    title = "Variables of Importance",
+    x = "Variables",
+    y = "Importance"
+  )
+```
+
+## Comparing all Models
+
+MLR RMSE and MAE:
+```{r}
+final_fit |>
+  collect_metrics()
+```
+
+Lasso RMSE and MAE:
+```{r}
+lasso_metrics <- LASSO_final |>
+  predict(bike_test) |>
+  bind_cols(bike_test) |>
+  metrics(truth = bike_count, estimate = .pred) |>
+  filter(.metric %in% c("rmse", "mae"))
+lasso_metrics
+```
+
+Regression Tree RMSE and MAE: 
+
+```{r}
+
+tree_final <- tree_final_wkf |>
+  finalize_workflow(tree_best_params) |>
+  fit(bike_train)
+
+tree_metrics <- tree_final |>
+  predict(bike_test) |>
+  bind_cols(bike_test) |>
+  metrics(truth = bike_count, estimate = .pred) |>
+  filter(.metric %in% c("rmse", "mae"))
+tree_metrics
+```
+Bagged Tree RMSE and MAE: 
+
+```{r}
+bag_final <- bag_wkf |>
+  finalize_workflow(bag_best_parmas) |>
+  fit(bike_train)
+
+bag_metrics <- bag_final |>
+  predict(bike_test) |>
+  bind_cols(bike_test) |>
+  metrics(truth = bike_count, estimate = .pred) |>
+  filter(.metric %in% c("rmse", "mae"))
+bag_metrics
+```
+
+Random Forest RMSE and MAE: 
+
+```{r}
+rf_final <- rf_final_wkf |>
+  finalize_workflow(rf_best_params) |>
+  fit(bike_train)
+
+rf_metrics <- rf_final |>
+  predict(bike_test) |>
+  bind_cols(bike_test) |>
+  metrics(truth = bike_count, estimate = .pred) |>
+  filter(.metric %in% c("rmse", "mae"))
+tree_metrics
+```
+
+Based on these values its hard to choose the exact best model.  The bagged tree model has the lowest RMSE while random forest/regression tree have the lowest MAEs.  Overall it looks like the bagged tree model works best. 
+
+## Final Fit
+
+Fitting to entire dataset.
+```{r}
+bag_final_fitted <- bag_wkf |>
+  finalize_workflow(bag_best_parmas) |>
+  fit(bike_data)
+bag_final_fitted
+```
